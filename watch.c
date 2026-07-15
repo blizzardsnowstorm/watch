@@ -6,7 +6,6 @@
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 #include <stdint.h>
-#include <time.h>
 #include <pthread.h>
 
 #include <libavformat/avformat.h>
@@ -18,8 +17,6 @@
 
 #include <alsa/asoundlib.h>
 
-#define MAX_QUEUE_SIZE 100
-
 typedef struct QueueNode {
     AVPacket *packet;
     struct QueueNode *next;
@@ -28,10 +25,9 @@ typedef struct QueueNode {
 typedef struct {
     QueueNode *head;
     QueueNode *tail;
-    int size;
+    volatile int size;
     pthread_mutex_t mutex;
     pthread_cond_t cond_first;
-    pthread_cond_t cond_space;
     int abort;
 } PacketQueue;
 
@@ -41,7 +37,6 @@ void queue_init(PacketQueue *q) {
     q->size = 0;
     pthread_mutex_init(&q->mutex, NULL);
     pthread_cond_init(&q->cond_first, NULL);
-    pthread_cond_init(&q->cond_space, NULL);
     q->abort = 0;
 }
 
@@ -54,9 +49,6 @@ void queue_put(PacketQueue *q, AVPacket *pkt) {
     node->next = NULL;
 
     pthread_mutex_lock(&q->mutex);
-    while (q->size >= MAX_QUEUE_SIZE && !q->abort) {
-        pthread_cond_wait(&q->cond_space, &q->mutex);
-    }
     if (q->abort) {
         av_packet_free(&new_pkt);
         free(node);
@@ -90,7 +82,6 @@ AVPacket* queue_get(PacketQueue *q) {
         q->tail = NULL;
     }
     q->size--;
-    pthread_cond_signal(&q->cond_space);
     pthread_mutex_unlock(&q->mutex);
 
     AVPacket *pkt = node->packet;
@@ -102,7 +93,6 @@ void queue_free(PacketQueue *q) {
     pthread_mutex_lock(&q->mutex);
     q->abort = 1;
     pthread_cond_broadcast(&q->cond_first);
-    pthread_cond_broadcast(&q->cond_space);
     QueueNode *curr = q->head;
     while (curr) {
         QueueNode *next = curr->next;
@@ -115,11 +105,28 @@ void queue_free(PacketQueue *q) {
     pthread_mutex_unlock(&q->mutex);
 }
 
+volatile double audio_clock = 0.0;
+pthread_mutex_t clock_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void set_audio_clock(double val) {
+    pthread_mutex_lock(&clock_mutex);
+    audio_clock = val;
+    pthread_mutex_unlock(&clock_mutex);
+}
+
+double get_audio_clock() {
+    pthread_mutex_lock(&clock_mutex);
+    double val = audio_clock;
+    pthread_mutex_unlock(&clock_mutex);
+    return val;
+}
+
 typedef struct {
     PacketQueue *queue;
     AVCodecContext *codec_ctx;
     snd_pcm_t *pcm_handle;
     SwrContext *swr_ctx;
+    AVRational time_base;
 } AudioThreadArgs;
 
 typedef struct {
@@ -130,6 +137,7 @@ typedef struct {
     struct fb_var_screeninfo vinfo;
     struct fb_fix_screeninfo finfo;
     AVFrame *frame_rgb;
+    AVRational time_base;
 } VideoThreadArgs;
 
 void* audio_thread_func(void *arg) {
@@ -147,22 +155,40 @@ void* audio_thread_func(void *arg) {
 
         if (avcodec_send_packet(args->codec_ctx, packet) >= 0) {
             while (avcodec_receive_frame(args->codec_ctx, audio_frame) >= 0) {
-                int out_samples = audio_frame->nb_samples;
+                int64_t delay = swr_get_delay(args->swr_ctx, args->codec_ctx->sample_rate);
+                int out_samples = av_rescale_rnd(delay + audio_frame->nb_samples,
+                                                 args->codec_ctx->sample_rate,
+                                                 args->codec_ctx->sample_rate,
+                                                 AV_ROUND_UP);
+
                 if (out_samples > max_out_samples) {
                     max_out_samples = out_samples;
                     output_buffer = realloc(output_buffer, max_out_samples * channels * bytes_per_sample);
                 }
 
-                swr_convert(args->swr_ctx, &output_buffer, out_samples,
-                            (const uint8_t **)audio_frame->data, audio_frame->nb_samples);
+                int converted = swr_convert(args->swr_ctx, &output_buffer, out_samples,
+                                            (const uint8_t **)audio_frame->data, audio_frame->nb_samples);
 
-                int err = snd_pcm_writei(args->pcm_handle, output_buffer, out_samples);
-                if (err == -EPIPE) {
-                    snd_pcm_prepare(args->pcm_handle);
-                    snd_pcm_writei(args->pcm_handle, output_buffer, out_samples);
-                } else if (err == -EAGAIN) {
-                    usleep(1000);
-                    snd_pcm_writei(args->pcm_handle, output_buffer, out_samples);
+                if (converted > 0) {
+                    double pts = 0.0;
+                    if (audio_frame->pts != AV_NOPTS_VALUE) {
+                        pts = audio_frame->pts * av_q2d(args->time_base);
+                    }
+
+                    snd_pcm_sframes_t delay_frames = 0;
+                    if (snd_pcm_delay(args->pcm_handle, &delay_frames) == 0) {
+                        pts -= (double)delay_frames / args->codec_ctx->sample_rate;
+                    }
+                    set_audio_clock(pts);
+
+                    int err = snd_pcm_writei(args->pcm_handle, output_buffer, converted);
+                    if (err == -EPIPE) {
+                        snd_pcm_prepare(args->pcm_handle);
+                        snd_pcm_writei(args->pcm_handle, output_buffer, converted);
+                    } else if (err == -EAGAIN) {
+                        usleep(1000);
+                        snd_pcm_writei(args->pcm_handle, output_buffer, converted);
+                    }
                 }
             }
         }
@@ -176,8 +202,6 @@ void* audio_thread_func(void *arg) {
 void* video_thread_func(void *arg) {
     VideoThreadArgs *args = (VideoThreadArgs *)arg;
     AVFrame *frame = av_frame_alloc();
-    struct timespec start, end;
-    const long frame_delay_us = 33333;
 
     while (1) {
         AVPacket *packet = queue_get(args->queue);
@@ -185,7 +209,21 @@ void* video_thread_func(void *arg) {
 
         if (avcodec_send_packet(args->codec_ctx, packet) >= 0) {
             while (avcodec_receive_frame(args->codec_ctx, frame) >= 0) {
-                clock_gettime(CLOCK_MONOTONIC, &start);
+                double pts = 0.0;
+                if (frame->pts != AV_NOPTS_VALUE) {
+                    pts = frame->pts * av_q2d(args->time_base);
+                }
+
+                double audio_pts = get_audio_clock();
+                double diff = pts - audio_pts;
+
+                if (diff < -0.100) {
+                    continue;
+                }
+
+                if (diff > 0.010) {
+                    usleep((unsigned int)(diff * 1000000.0));
+                }
 
                 sws_scale(args->sws_ctx, (uint8_t const * const *)frame->data,
                           frame->linesize, 0, args->codec_ctx->height,
@@ -195,14 +233,6 @@ void* video_thread_func(void *arg) {
                     uint8_t *dest = args->fbp + (y * args->finfo.line_length);
                     uint8_t *src = args->frame_rgb->data[0] + (y * args->frame_rgb->linesize[0]);
                     memcpy(dest, src, args->vinfo.xres * (args->vinfo.bits_per_pixel / 8));
-                }
-
-                clock_gettime(CLOCK_MONOTONIC, &end);
-                long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000 +
-                (end.tv_nsec - start.tv_nsec) / 1000;
-
-                if (elapsed_us < frame_delay_us) {
-                    usleep(frame_delay_us - elapsed_us);
                 }
             }
         }
@@ -293,13 +323,20 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        snd_pcm_set_params(pcm_handle,
-                           SND_PCM_FORMAT_S16_LE,
-                           SND_PCM_ACCESS_RW_INTERLEAVED,
-                           a_codec_ctx->ch_layout.nb_channels,
-                           a_codec_ctx->sample_rate,
-                           1,
-                           150000);
+        snd_pcm_hw_params_t *hw_params;
+        snd_pcm_hw_params_alloca(&hw_params);
+        snd_pcm_hw_params_any(pcm_handle, hw_params);
+        snd_pcm_hw_params_set_access(pcm_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+        snd_pcm_hw_params_set_format(pcm_handle, hw_params, SND_PCM_FORMAT_S16_LE);
+        snd_pcm_hw_params_set_channels(pcm_handle, hw_params, a_codec_ctx->ch_layout.nb_channels);
+        unsigned int rate = a_codec_ctx->sample_rate;
+        snd_pcm_hw_params_set_rate_near(pcm_handle, hw_params, &rate, 0);
+
+        snd_pcm_uframes_t buffer_size = rate;
+        snd_pcm_uframes_t period_size = rate / 4;
+        snd_pcm_hw_params_set_buffer_size_near(pcm_handle, hw_params, &buffer_size);
+        snd_pcm_hw_params_set_period_size_near(pcm_handle, hw_params, &period_size, 0);
+        snd_pcm_hw_params(pcm_handle, hw_params);
 
         swr_ctx = swr_alloc();
         av_opt_set_chlayout(swr_ctx, "in_chlayout", &a_codec_ctx->ch_layout, 0);
@@ -317,6 +354,7 @@ int main(int argc, char *argv[]) {
         audio_args.codec_ctx = a_codec_ctx;
         audio_args.pcm_handle = pcm_handle;
         audio_args.swr_ctx = swr_ctx;
+        audio_args.time_base = format_ctx->streams[audio_stream_idx]->time_base;
 
         pthread_create(&audio_thread, NULL, audio_thread_func, &audio_args);
     }
@@ -328,11 +366,16 @@ int main(int argc, char *argv[]) {
     video_args.vinfo = vinfo;
     video_args.finfo = finfo;
     video_args.frame_rgb = frame_rgb;
+    video_args.time_base = format_ctx->streams[video_stream_idx]->time_base;
 
     pthread_create(&video_thread, NULL, video_thread_func, &video_args);
 
     AVPacket *packet = av_packet_alloc();
     while (av_read_frame(format_ctx, packet) >= 0) {
+        while (video_queue.size > 150 && !video_queue.abort) {
+            usleep(10000);
+        }
+
         if (packet->stream_index == video_stream_idx) {
             queue_put(&video_queue, packet);
         } else if (packet->stream_index == audio_stream_idx && pcm_handle != NULL) {
