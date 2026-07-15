@@ -18,60 +18,79 @@
 
 #include <alsa/asoundlib.h>
 
-typedef struct AudioQueueNode {
+#define MAX_QUEUE_SIZE 100
+
+typedef struct QueueNode {
     AVPacket *packet;
-    struct AudioQueueNode *next;
-} AudioQueueNode;
+    struct QueueNode *next;
+} QueueNode;
 
 typedef struct {
-    AudioQueueNode *head;
-    AudioQueueNode *tail;
+    QueueNode *head;
+    QueueNode *tail;
+    int size;
     pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    pthread_cond_t cond_first;
+    pthread_cond_t cond_space;
     int abort;
-} AudioQueue;
+} PacketQueue;
 
-void queue_init(AudioQueue *q) {
+void queue_init(PacketQueue *q) {
     q->head = NULL;
     q->tail = NULL;
+    q->size = 0;
     pthread_mutex_init(&q->mutex, NULL);
-    pthread_cond_init(&q->cond, NULL);
+    pthread_cond_init(&q->cond_first, NULL);
+    pthread_cond_init(&q->cond_space, NULL);
     q->abort = 0;
 }
 
-void queue_put(AudioQueue *q, AVPacket *pkt) {
+void queue_put(PacketQueue *q, AVPacket *pkt) {
     AVPacket *new_pkt = av_packet_alloc();
     av_packet_ref(new_pkt, pkt);
 
-    AudioQueueNode *node = malloc(sizeof(AudioQueueNode));
+    QueueNode *node = malloc(sizeof(QueueNode));
     node->packet = new_pkt;
     node->next = NULL;
 
     pthread_mutex_lock(&q->mutex);
+    while (q->size >= MAX_QUEUE_SIZE && !q->abort) {
+        pthread_cond_wait(&q->cond_space, &q->mutex);
+    }
+    if (q->abort) {
+        av_packet_free(&new_pkt);
+        free(node);
+        pthread_mutex_unlock(&q->mutex);
+        return;
+    }
+
     if (!q->tail) {
         q->head = node;
     } else {
         q->tail->next = node;
     }
     q->tail = node;
-    pthread_cond_signal(&q->cond);
+    q->size++;
+    pthread_cond_signal(&q->cond_first);
     pthread_mutex_unlock(&q->mutex);
 }
 
-AVPacket* queue_get(AudioQueue *q) {
+AVPacket* queue_get(PacketQueue *q) {
     pthread_mutex_lock(&q->mutex);
     while (!q->head && !q->abort) {
-        pthread_cond_wait(&q->cond, &q->mutex);
+        pthread_cond_wait(&q->cond_first, &q->mutex);
     }
     if (q->abort && !q->head) {
         pthread_mutex_unlock(&q->mutex);
         return NULL;
     }
-    AudioQueueNode *node = q->head;
+    QueueNode *node = q->head;
     q->head = q->head->next;
     if (!q->head) {
         q->tail = NULL;
     }
+    q->size--;
+    pthread_cond_signal(&q->cond_space);
     pthread_mutex_unlock(&q->mutex);
 
     AVPacket *pkt = node->packet;
@@ -79,31 +98,48 @@ AVPacket* queue_get(AudioQueue *q) {
     return pkt;
 }
 
-void queue_free(AudioQueue *q) {
+void queue_free(PacketQueue *q) {
     pthread_mutex_lock(&q->mutex);
     q->abort = 1;
-    pthread_cond_broadcast(&q->cond);
-    AudioQueueNode *curr = q->head;
+    pthread_cond_broadcast(&q->cond_first);
+    pthread_cond_broadcast(&q->cond_space);
+    QueueNode *curr = q->head;
     while (curr) {
-        AudioQueueNode *next = curr->next;
+        QueueNode *next = curr->next;
         av_packet_free(&curr->packet);
         free(curr);
         curr = next;
     }
     q->head = q->tail = NULL;
+    q->size = 0;
     pthread_mutex_unlock(&q->mutex);
 }
 
 typedef struct {
-    AudioQueue *queue;
+    PacketQueue *queue;
     AVCodecContext *codec_ctx;
     snd_pcm_t *pcm_handle;
     SwrContext *swr_ctx;
 } AudioThreadArgs;
 
+typedef struct {
+    PacketQueue *queue;
+    AVCodecContext *codec_ctx;
+    struct SwsContext *sws_ctx;
+    uint8_t *fbp;
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    AVFrame *frame_rgb;
+} VideoThreadArgs;
+
 void* audio_thread_func(void *arg) {
     AudioThreadArgs *args = (AudioThreadArgs *)arg;
     AVFrame *audio_frame = av_frame_alloc();
+
+    int max_out_samples = 8192;
+    int channels = args->codec_ctx->ch_layout.nb_channels;
+    int bytes_per_sample = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+    uint8_t *output_buffer = malloc(max_out_samples * channels * bytes_per_sample);
 
     while (1) {
         AVPacket *packet = queue_get(args->queue);
@@ -112,10 +148,13 @@ void* audio_thread_func(void *arg) {
         if (avcodec_send_packet(args->codec_ctx, packet) >= 0) {
             while (avcodec_receive_frame(args->codec_ctx, audio_frame) >= 0) {
                 int out_samples = audio_frame->nb_samples;
-                uint8_t *output_buffer = NULL;
-                av_samples_alloc(&output_buffer, NULL, args->codec_ctx->ch_layout.nb_channels, out_samples, AV_SAMPLE_FMT_S16, 0);
+                if (out_samples > max_out_samples) {
+                    max_out_samples = out_samples;
+                    output_buffer = realloc(output_buffer, max_out_samples * channels * bytes_per_sample);
+                }
 
-                swr_convert(args->swr_ctx, &output_buffer, out_samples, (const uint8_t **)audio_frame->data, audio_frame->nb_samples);
+                swr_convert(args->swr_ctx, &output_buffer, out_samples,
+                            (const uint8_t **)audio_frame->data, audio_frame->nb_samples);
 
                 int err = snd_pcm_writei(args->pcm_handle, output_buffer, out_samples);
                 if (err == -EPIPE) {
@@ -125,13 +164,51 @@ void* audio_thread_func(void *arg) {
                     usleep(1000);
                     snd_pcm_writei(args->pcm_handle, output_buffer, out_samples);
                 }
-
-                av_freep(&output_buffer);
             }
         }
         av_packet_free(&packet);
     }
+    free(output_buffer);
     av_frame_free(&audio_frame);
+    return NULL;
+}
+
+void* video_thread_func(void *arg) {
+    VideoThreadArgs *args = (VideoThreadArgs *)arg;
+    AVFrame *frame = av_frame_alloc();
+    struct timespec start, end;
+    const long frame_delay_us = 33333;
+
+    while (1) {
+        AVPacket *packet = queue_get(args->queue);
+        if (!packet) break;
+
+        if (avcodec_send_packet(args->codec_ctx, packet) >= 0) {
+            while (avcodec_receive_frame(args->codec_ctx, frame) >= 0) {
+                clock_gettime(CLOCK_MONOTONIC, &start);
+
+                sws_scale(args->sws_ctx, (uint8_t const * const *)frame->data,
+                          frame->linesize, 0, args->codec_ctx->height,
+                          args->frame_rgb->data, args->frame_rgb->linesize);
+
+                for (int y = 0; y < args->vinfo.yres; y++) {
+                    uint8_t *dest = args->fbp + (y * args->finfo.line_length);
+                    uint8_t *src = args->frame_rgb->data[0] + (y * args->frame_rgb->linesize[0]);
+                    memcpy(dest, src, args->vinfo.xres * (args->vinfo.bits_per_pixel / 8));
+                }
+
+                clock_gettime(CLOCK_MONOTONIC, &end);
+                long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000 +
+                (end.tv_nsec - start.tv_nsec) / 1000;
+
+                if (elapsed_us < frame_delay_us) {
+                    usleep(frame_delay_us - elapsed_us);
+                }
+            }
+        }
+        av_packet_free(&packet);
+    }
+    av_frame_free(&frame);
     return NULL;
 }
 
@@ -178,15 +255,33 @@ int main(int argc, char *argv[]) {
     avcodec_parameters_to_context(v_codec_ctx, v_codec_params);
     avcodec_open2(v_codec_ctx, v_codec, NULL);
 
+    AVFrame *frame_rgb = av_frame_alloc();
+    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB32, vinfo.xres, vinfo.yres, 1);
+    uint8_t *buffer = (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
+    av_image_fill_arrays(frame_rgb->data, frame_rgb->linesize, buffer,
+                         AV_PIX_FMT_RGB32, vinfo.xres, vinfo.yres, 1);
+
+    struct SwsContext *sws_ctx = sws_getContext(
+        v_codec_ctx->width, v_codec_ctx->height, v_codec_ctx->pix_fmt,
+        vinfo.xres, vinfo.yres, AV_PIX_FMT_RGB32,
+        SWS_POINT, NULL, NULL, NULL
+    );
+
+    PacketQueue audio_queue;
+    PacketQueue video_queue;
+    queue_init(&audio_queue);
+    queue_init(&video_queue);
+
+    pthread_t audio_thread;
+    pthread_t video_thread;
+    AudioThreadArgs audio_args;
+    VideoThreadArgs video_args;
+
     AVCodecContext *a_codec_ctx = NULL;
     snd_pcm_t *pcm_handle = NULL;
     SwrContext *swr_ctx = NULL;
-    AudioQueue audio_queue;
-    pthread_t audio_thread;
-    AudioThreadArgs thread_args;
 
     if (audio_stream_idx != -1) {
-        queue_init(&audio_queue);
         AVCodecParameters *a_codec_params = format_ctx->streams[audio_stream_idx]->codecpar;
         const AVCodec *a_codec = avcodec_find_decoder(a_codec_params->codec_id);
         a_codec_ctx = avcodec_alloc_context3(a_codec);
@@ -218,63 +313,36 @@ int main(int argc, char *argv[]) {
         av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
         swr_init(swr_ctx);
 
-        thread_args.queue = &audio_queue;
-        thread_args.codec_ctx = a_codec_ctx;
-        thread_args.pcm_handle = pcm_handle;
-        thread_args.swr_ctx = swr_ctx;
+        audio_args.queue = &audio_queue;
+        audio_args.codec_ctx = a_codec_ctx;
+        audio_args.pcm_handle = pcm_handle;
+        audio_args.swr_ctx = swr_ctx;
 
-        pthread_create(&audio_thread, NULL, audio_thread_func, &thread_args);
+        pthread_create(&audio_thread, NULL, audio_thread_func, &audio_args);
     }
 
-    AVFrame *frame = av_frame_alloc();
-    AVFrame *frame_rgb = av_frame_alloc();
+    video_args.queue = &video_queue;
+    video_args.codec_ctx = v_codec_ctx;
+    video_args.sws_ctx = sws_ctx;
+    video_args.fbp = fbp;
+    video_args.vinfo = vinfo;
+    video_args.finfo = finfo;
+    video_args.frame_rgb = frame_rgb;
 
-    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB32, vinfo.xres, vinfo.yres, 1);
-    uint8_t *buffer = (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
-    av_image_fill_arrays(frame_rgb->data, frame_rgb->linesize, buffer,
-                         AV_PIX_FMT_RGB32, vinfo.xres, vinfo.yres, 1);
-
-    struct SwsContext *sws_ctx = sws_getContext(
-        v_codec_ctx->width, v_codec_ctx->height, v_codec_ctx->pix_fmt,
-        vinfo.xres, vinfo.yres, AV_PIX_FMT_RGB32,
-        SWS_POINT, NULL, NULL, NULL
-    );
+    pthread_create(&video_thread, NULL, video_thread_func, &video_args);
 
     AVPacket *packet = av_packet_alloc();
-    struct timespec start, end;
-    const long frame_delay_us = 33333;
-
     while (av_read_frame(format_ctx, packet) >= 0) {
         if (packet->stream_index == video_stream_idx) {
-            if (avcodec_send_packet(v_codec_ctx, packet) >= 0) {
-                while (avcodec_receive_frame(v_codec_ctx, frame) >= 0) {
-                    clock_gettime(CLOCK_MONOTONIC, &start);
-
-                    sws_scale(sws_ctx, (uint8_t const * const *)frame->data,
-                              frame->linesize, 0, v_codec_ctx->height,
-                              frame_rgb->data, frame_rgb->linesize);
-
-                    for (int y = 0; y < vinfo.yres; y++) {
-                        uint8_t *dest = fbp + (y * finfo.line_length);
-                        uint8_t *src = frame_rgb->data[0] + (y * frame_rgb->linesize[0]);
-                        memcpy(dest, src, vinfo.xres * (vinfo.bits_per_pixel / 8));
-                    }
-
-                    clock_gettime(CLOCK_MONOTONIC, &end);
-                    long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000 +
-                    (end.tv_nsec - start.tv_nsec) / 1000;
-
-                    if (elapsed_us < frame_delay_us) {
-                        usleep(frame_delay_us - elapsed_us);
-                    }
-                }
-            }
-        }
-        else if (packet->stream_index == audio_stream_idx && pcm_handle != NULL) {
+            queue_put(&video_queue, packet);
+        } else if (packet->stream_index == audio_stream_idx && pcm_handle != NULL) {
             queue_put(&audio_queue, packet);
         }
         av_packet_unref(packet);
     }
+
+    queue_free(&video_queue);
+    pthread_join(video_thread, NULL);
 
     if (audio_stream_idx != -1) {
         queue_free(&audio_queue);
@@ -284,7 +352,6 @@ int main(int argc, char *argv[]) {
     av_packet_free(&packet);
     av_free(buffer);
     av_frame_free(&frame_rgb);
-    av_frame_free(&frame);
     avcodec_free_context(&v_codec_ctx);
     if (a_codec_ctx) avcodec_free_context(&a_codec_ctx);
     if (swr_ctx) swr_free(&swr_ctx);
